@@ -15,6 +15,7 @@
 
 import array
 import requests
+from collections import defaultdict
 
 from ryu.base import app_manager
 from ryu.ofproto import ofproto_v1_3
@@ -32,47 +33,15 @@ class SimpleSwitchSnortOutOfBand(app_manager.RyuApp):
         super(SimpleSwitchSnortOutOfBand, self).__init__(*args, **kwargs)
         self.snort = kwargs['snortlib']
         self.snort_port = 3
-
-# Copyright (C) 2013 Nippon Telegraph and Telephone Corporation.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-# implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-from __future__ import print_function
-
-import array
-
-from ryu.base import app_manager
-from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
-from ryu.controller.handler import set_ev_cls
-from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet
-from ryu.lib.packet import ethernet
-from ryu.lib.packet import ipv4
-from ryu.lib.packet import icmp
-from ryu.lib import snortlib
-
-
-class SimpleSwitchSnort(app_manager.RyuApp):
-    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
-    _CONTEXTS = {'snortlib': snortlib.SnortLib}
-
-    def __init__(self, *args, **kwargs):
-        super(SimpleSwitchSnort, self).__init__(*args, **kwargs)
-        self.snort = kwargs['snortlib']
-        self.snort_port = 3
-        self.mac_to_port = {}
+        nested_dict = lambda: defaultdict(nested_dict)
+        self.mac_to_port = nest = nested_dict()
+        self.vlan10 = [
+            1,4,6,7
+            ]
+        self.vlan20 = [
+            2,3,5
+            ]
+        #self.DFR_storage_ip = "10.0.1.4"
 
         socket_config = {'unixsock': False}
 
@@ -191,28 +160,37 @@ class SimpleSwitchSnort(app_manager.RyuApp):
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
-        self.mac_to_port.setdefault(dpid, {})
 
-
-        # Learn a mac address to avoid FLOOD next time
+        # Learn a mac address to avoid FLOOD next time, ensuring control
+        # plane and data plane are isolated
+        if in_port in self.vlan10:
+            vlan='vlan10'
+            ports_list=self.vlan10
+        elif in_port in self.vlan20:
+            vlan='vlan20'
+            ports_list=self.vlan20
 
         # self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
 
-        self.mac_to_port[dpid][src] = in_port
+        self.mac_to_port[dpid][vlan][src] = in_port
 
-        if dst in self.mac_to_port[dpid]:
-            out_port = self.mac_to_port[dpid][dst]
+        if dst in self.mac_to_port[dpid][vlan]:
+            out_port = self.mac_to_port[dpid][vlan][dst]
+            actions = [parser.OFPActionOutput(self.snort_port),
+            parser.OFPActionOutput(out_port)]
 
-        else:
-            out_port = ofproto.OFPP_FLOOD
-
-        actions = [parser.OFPActionOutput(self.snort_port),
-        parser.OFPActionOutput(out_port)]
-
-        # install a flow to avoid packet_in next time
-        if out_port != ofproto.OFPP_FLOOD:
+            # Install a flow to avoid packet_in next time
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
             self.add_flow(datapath, 1, match, actions)
+        else:
+            # Avoid putting snort_port twice in the list of output ports
+            if self.snort_port not in ports_list:
+                actions=[parser.OFPActionOutput(self.snort_port)]
+            else:
+                actions=[]
+            # Broadcasting packet to all ports in the vlan
+            for out_port in ports_list:
+                actions.append(parser.OFPActionOutput(out_port))
 
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
