@@ -15,13 +15,14 @@
 
 import array
 import requests
+from collections import defaultdict
 
 from ryu.base import app_manager
 from ryu.ofproto import ofproto_v1_3
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.lib import snortlib
-from ryu.lib.packet import packet, ethernet, ipv4, ipv6, icmp
+from ryu.lib.packet import packet, ethernet, ipv4, ipv6, icmp, vlan
 
 
 class SimpleSwitchSnortOutOfBand(app_manager.RyuApp):
@@ -33,7 +34,16 @@ class SimpleSwitchSnortOutOfBand(app_manager.RyuApp):
         self.snort = kwargs['snortlib']
         self.snort_in_port = 3
         self.snort_out_port = 8
-        self.mac_to_port = {}
+        nested_dict = lambda: defaultdict(nested_dict)
+        self.mac_to_port = nest = nested_dict()
+        self.vlans = {10:[1,4,6,7],20:[2,5]}
+        #self.vlan10 = [
+        #    1,4,6,7
+        #    ]
+        #self.vlan20 = [
+        #    2,3,5
+        #    ]
+        #self.DFR_storage_ip = "10.0.1.4"
 
         socket_config = {'unixsock': False}
 
@@ -148,34 +158,50 @@ class SimpleSwitchSnortOutOfBand(app_manager.RyuApp):
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
+        vlan_header = pkt.get_protocols(vlan.vlan)
 
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
-        self.mac_to_port.setdefault(dpid, {})
+
+        # Ensure control plane and data plane are isolated
+        if in_port in self.vlans[10]:
+            vlan_id=10
+            #ports_list=self.vlan10
+        elif in_port in self.vlans[20]:
+            vlan_id=20
+            #ports_list=self.vlan20
+        elif in_port == self.snort_out_port:
+            vlan_id=vlan_header[0].vid
+
+        ports_list=self.vlans[vlan_id]
 
         if in_port != self.snort_out_port:
             # Learn a mac address to avoid FLOOD next time
-            self.mac_to_port[dpid][src] = in_port
+            self.mac_to_port[dpid][vlan_id][src] = in_port
 
-            # Send to Snort
+            # Send to Snort adding vlan info
             out_port = self.snort_in_port
-            actions = [parser.OFPActionOutput(out_port)]
+            actions = [parser.OFPActionPushVlan(33024),
+                       parser.OFPActionSetField(vlan_vid=(0x1000) | vlan_id),
+                       parser.OFPActionOutput(out_port)]
 
             # Install a flow to avoid packet_in next time
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
             self.add_flow(datapath, 1, match, actions)
         elif in_port == self.snort_out_port:
-            if dst in self.mac_to_port[dpid]:
-                out_port = self.mac_to_port[dpid][dst]
-                actions = [parser.OFPActionOutput(out_port)]
+            if dst in self.mac_to_port[dpid][vlan_id]:
+                out_port = self.mac_to_port[dpid][vlan_id][dst]
+                actions = [parser.OFPActionPopVlan(), parser.OFPActionOutput(out_port)]
 
                 # Install a flow to avoid packet_in next time
-                match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
+                match = parser.OFPMatch(in_port=in_port, eth_dst=dst, vlan_vid=(0x1000) | vlan_id)
                 self.add_flow(datapath, 1, match, actions)
             else:
-                out_port = ofproto.OFPP_FLOOD
-                actions = [parser.OFPActionOutput(out_port)]
+                actions=[parser.OFPActionPopVlan()]
+                # Broadcasting packet to all ports in the vlan
+                for out_port in ports_list:
+                    actions.append(parser.OFPActionOutput(out_port))
 
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
